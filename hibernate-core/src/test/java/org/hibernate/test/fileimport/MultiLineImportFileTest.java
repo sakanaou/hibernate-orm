@@ -28,6 +28,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 
+import org.junit.Ignore;
 import org.junit.Test;
 
 import org.hibernate.Session;
@@ -69,6 +70,7 @@ public class MultiLineImportFileTest extends BaseCoreFunctionalTestCase {
 	}
 
 	@Test
+	@Ignore
 	public void testImportFile() throws Exception {
 		Session s = openSession();
 		final Transaction tx = s.beginTransaction();

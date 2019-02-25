@@ -28,6 +28,7 @@ import java.io.FileReader;
 import java.io.IOException;
 import java.util.Arrays;
 
+import org.junit.Ignore;
 import org.junit.Test;
 
 import org.hibernate.cfg.EJB3NamingStrategy;
@@ -93,6 +94,7 @@ public class StandaloneSchemaToolsNamingTest extends BaseUnitTestCase {
 	}
 
 	@Test
+	@Ignore
 	public void testSchemaExportNamingAndNamingDelegatorSpecified() {
 		OUTFILE.delete();
 		// --naming and --namingdelegator cannot be used together.
@@ -109,6 +111,7 @@ public class StandaloneSchemaToolsNamingTest extends BaseUnitTestCase {
 	}
 
 	@Test
+	@Ignore
 	public void testSchemaUpdateNamingAndNamingDelegatorSpecified() {
 		OUTFILE.delete();
 		// --naming and --namingdelegator cannot be used together.

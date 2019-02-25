@@ -35,6 +35,7 @@ import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -63,6 +64,11 @@ import org.hibernate.internal.CoreLogging;
 import org.hibernate.internal.CoreMessageLogger;
 import org.hibernate.proxy.HibernateProxy;
 import org.hibernate.proxy.LazyInitializer;
+import org.hibernate.type.CollectionType;
+import org.hibernate.type.CompositeType;
+import org.hibernate.type.EntityType;
+import org.hibernate.type.ForeignKeyDirection;
+import org.hibernate.type.OneToOneType;
 import org.hibernate.type.Type;
 
 /**
@@ -793,7 +799,7 @@ public class ActionQueue {
 	 * Sorts the insert actions using more hashes.
 	 * </p>
 	 * NOTE: this class is not thread-safe.
-	 * 
+	 *
 	 * @author Jay Erb
 	 */
 	private static class InsertActionSorter implements ExecutableList.Sorter<AbstractEntityInsertAction> {
@@ -802,12 +808,106 @@ public class ActionQueue {
 		 */
 		public static final InsertActionSorter INSTANCE = new InsertActionSorter();
 
+		private static class BatchIdentifier {
+
+			private final String entityName;
+			private final String rootEntityName;
+
+			private Set<String> parentEntityNames = new HashSet<>( );
+
+			private Set<String> childEntityNames = new HashSet<>( );
+
+			private BatchIdentifier parent;
+
+			BatchIdentifier(String entityName, String rootEntityName) {
+				this.entityName = entityName;
+				this.rootEntityName = rootEntityName;
+			}
+
+			public BatchIdentifier getParent() {
+				return parent;
+			}
+
+			public void setParent(BatchIdentifier parent) {
+				this.parent = parent;
+			}
+
+			@Override
+			public boolean equals(Object o) {
+				if ( this == o ) {
+					return true;
+				}
+				if ( !( o instanceof BatchIdentifier ) ) {
+					return false;
+				}
+				BatchIdentifier that = (BatchIdentifier) o;
+				return Objects.equals( entityName, that.entityName );
+			}
+
+			@Override
+			public int hashCode() {
+				return Objects.hash( entityName );
+			}
+
+			String getEntityName() {
+				return entityName;
+			}
+
+			String getRootEntityName() {
+				return rootEntityName;
+			}
+
+			Set<String> getParentEntityNames() {
+				return parentEntityNames;
+			}
+
+			Set<String> getChildEntityNames() {
+				return childEntityNames;
+			}
+
+			boolean hasAnyParentEntityNames(BatchIdentifier batchIdentifier) {
+				return parentEntityNames.contains( batchIdentifier.getEntityName() ) ||
+						parentEntityNames.contains( batchIdentifier.getRootEntityName() );
+			}
+
+			boolean hasAnyChildEntityNames(BatchIdentifier batchIdentifier) {
+				return childEntityNames.contains( batchIdentifier.getEntityName() );
+			}
+
+			/**
+			 * Check if the this {@link BatchIdentifier} has a parent or grand parent
+			 * matching the given {@link BatchIdentifier reference.
+			 *
+			 * @param batchIdentifier {@link BatchIdentifier} reference
+			 *
+			 * @return This {@link BatchIdentifier} has a parent matching the given {@link BatchIdentifier reference
+			 */
+			boolean hasParent(BatchIdentifier batchIdentifier) {
+				return (
+						parent == batchIdentifier
+								|| parentEntityNames.contains( batchIdentifier.getEntityName() )
+								|| ( parentEntityNames.contains( batchIdentifier.getRootEntityName() ) && !this.getEntityName().equals( batchIdentifier.getRootEntityName() ) )
+								|| parent != null && parent.hasParent( batchIdentifier, new ArrayList<>() )
+				);
+			}
+
+			private boolean hasParent(BatchIdentifier batchIdentifier, List<BatchIdentifier> stack) {
+				if ( !stack.contains( this ) && parent != null ) {
+					stack.add( this );
+					return parent.hasParent( batchIdentifier, stack );
+				}
+				return (
+						parent == batchIdentifier
+								|| parentEntityNames.contains( batchIdentifier.getEntityName() )
+				);
+			}
+		}
+
 		// the mapping of entity names to their latest batch numbers.
-		private Map<String, Integer> latestBatches;
-		private Map<Object, Integer> entityBatchNumber;
+		private List<BatchIdentifier> latestBatches;
 
 		// the map of batch numbers to EntityInsertAction lists
-		private Map<Integer, List<AbstractEntityInsertAction>> actionBatches;
+		private Map<BatchIdentifier, List<AbstractEntityInsertAction>> actionBatches;
 
 		public InsertActionSorter() {
 		}
@@ -817,93 +917,205 @@ public class ActionQueue {
 		 */
 		public void sort(List<AbstractEntityInsertAction> insertions) {
 			// optimize the hash size to eliminate a rehash.
-			this.latestBatches = new HashMap<String, Integer>();
-			this.entityBatchNumber = new HashMap<Object, Integer>( insertions.size() + 1, 1.0f );
-			this.actionBatches = new HashMap<Integer, List<AbstractEntityInsertAction>>();
+			this.latestBatches = new ArrayList<>( );
+			this.actionBatches = new HashMap<>();
 
-			// the list of entity names that indicate the batch number
 			for ( AbstractEntityInsertAction action : insertions ) {
-				// remove the current element from insertions. It will be added back later.
-				String entityName = action.getEntityName();
+				BatchIdentifier batchIdentifier = new BatchIdentifier(
+						action.getEntityName(),
+						action.getSession()
+						      .getFactory()
+						      .getMetamodel()
+						      .entityPersister( action.getEntityName() )
+						      .getRootEntityName()
+				);
 
 				// the entity associated with the current action.
 				Object currentEntity = action.getInstance();
+				int index = latestBatches.indexOf( batchIdentifier );
 
-				Integer batchNumber;
-				if ( latestBatches.containsKey( entityName ) ) {
-					// There is already an existing batch for this type of entity.
-					// Check to see if the latest batch is acceptable.
-					batchNumber = findBatchNumber( action, entityName );
+				if ( index != -1 )  {
+					batchIdentifier = latestBatches.get( index );
 				}
 				else {
-					// add an entry for this type of entity.
-					// we can be assured that all referenced entities have already
-					// been processed,
-					// so specify that this entity is with the latest batch.
-					// doing the batch number before adding the name to the list is
-					// a faster way to get an accurate number.
-
-					batchNumber = actionBatches.size();
-					latestBatches.put( entityName, batchNumber );
+					latestBatches.add( batchIdentifier );
 				}
-				entityBatchNumber.put( currentEntity, batchNumber );
-				addToBatch( batchNumber, action );
+				addParentChildEntityNames( action, batchIdentifier );
+				addToBatch( batchIdentifier, action );
 			}
-			insertions.clear();
 
-			// now rebuild the insertions list. There is a batch for each entry in the name list.
-			for ( int i = 0; i < actionBatches.size(); i++ ) {
-				List<AbstractEntityInsertAction> batch = actionBatches.get( i );
-				insertions.addAll( batch );
+			// Examine each entry in the batch list, and build the dependency graph.
+			for ( int i = 0; i < latestBatches.size(); i++ ) {
+				BatchIdentifier batchIdentifier = latestBatches.get( i );
+
+				for ( int j = i - 1; j >= 0; j-- ) {
+					BatchIdentifier prevBatchIdentifier = latestBatches.get( j );
+					if ( prevBatchIdentifier.hasAnyParentEntityNames( batchIdentifier ) ) {
+						prevBatchIdentifier.parent = batchIdentifier;
+					}
+					if ( batchIdentifier.hasAnyChildEntityNames( prevBatchIdentifier ) ) {
+						prevBatchIdentifier.parent = batchIdentifier;
+					}
+				}
+
+				for ( int j = i + 1; j < latestBatches.size(); j++ ) {
+					BatchIdentifier nextBatchIdentifier = latestBatches.get( j );
+
+					if ( nextBatchIdentifier.hasAnyParentEntityNames( batchIdentifier ) ) {
+						nextBatchIdentifier.parent = batchIdentifier;
+					}
+					if ( batchIdentifier.hasAnyChildEntityNames( nextBatchIdentifier ) ) {
+						nextBatchIdentifier.parent = batchIdentifier;
+					}
+				}
+			}
+
+			boolean sorted = false;
+
+			long maxIterations = latestBatches.size() * latestBatches.size();
+			long iterations = 0;
+
+			sort:
+			do {
+				// Examine each entry in the batch list, sorting them based on parent/child association
+				// as depicted by the dependency graph.
+				iterations++;
+
+				for ( int i = 0; i < latestBatches.size(); i++ ) {
+					BatchIdentifier batchIdentifier = latestBatches.get( i );
+
+					// Iterate next batches and make sure that children types are after parents.
+					// Since the outer loop looks at each batch entry individually and the prior loop will reorder
+					// entries as well, we need to look and verify if the current batch is a child of the next
+					// batch or if the current batch is seen as a parent or child of the next batch.
+					for ( int j = i + 1; j < latestBatches.size(); j++ ) {
+						BatchIdentifier nextBatchIdentifier = latestBatches.get( j );
+
+						if ( batchIdentifier.hasParent( nextBatchIdentifier ) ) {
+							if( nextBatchIdentifier.hasParent( batchIdentifier ) ) {
+								//cycle detected, no need to continue
+								break sort;
+							}
+
+							latestBatches.remove( batchIdentifier );
+							latestBatches.add( j, batchIdentifier );
+
+							continue sort;
+						}
+					}
+				}
+				sorted = true;
+			}
+			while ( !sorted && iterations <= maxIterations);
+
+			if ( iterations > maxIterations ) {
+				LOG.warn( "The batch containing " + latestBatches.size() + " statements could not be sorted after " + maxIterations + " iterations. " +
+						"This might indicate a circular entity relationship." );
+			}
+
+			// Now, rebuild the insertions list. There is a batch for each entry in the name list.
+			if ( sorted ) {
+				insertions.clear();
+
+				for ( BatchIdentifier rootIdentifier : latestBatches ) {
+					List<AbstractEntityInsertAction> batch = actionBatches.get( rootIdentifier );
+					insertions.addAll( batch );
+				}
 			}
 		}
 
 		/**
-		 * Finds an acceptable batch for this entity to be a member as part of the {@link InsertActionSorter}
-		 * 
+		 * Add parent and child entity names so that we know how to rearrange dependencies
+		 *
 		 * @param action The action being sorted
-		 * @param entityName The name of the entity affected by the action
-		 * @return An appropriate batch number; todo document this process better
+		 * @param batchIdentifier The batch identifier of the entity affected by the action
 		 */
-		private Integer findBatchNumber(AbstractEntityInsertAction action, String entityName) {
-			// loop through all the associated entities and make sure they have been
-			// processed before the latest
-			// batch associated with this entity type.
-
-			// the current batch number is the latest batch for this entity type.
-			Integer latestBatchNumberForType = latestBatches.get( entityName );
-
-			// loop through all the associations of the current entity and make sure that they are processed
-			// before the current batch number
+		private void addParentChildEntityNames(AbstractEntityInsertAction action, BatchIdentifier batchIdentifier) {
 			Object[] propertyValues = action.getState();
-			Type[] propertyTypes = action.getPersister().getClassMetadata().getPropertyTypes();
+			ClassMetadata classMetadata = action.getPersister().getClassMetadata();
+			if ( classMetadata != null ) {
+				Type[] propertyTypes = classMetadata.getPropertyTypes();
+				Type identifierType = classMetadata.getIdentifierType();
 
-			for ( int i = 0; i < propertyValues.length; i++ ) {
-				Object value = propertyValues[i];
-				Type type = propertyTypes[i];
-				if ( type.isEntityType() && value != null ) {
-					// find the batch number associated with the current association, if any.
-					Integer associationBatchNumber = entityBatchNumber.get( value );
-					if ( associationBatchNumber != null && associationBatchNumber.compareTo( latestBatchNumberForType ) > 0 ) {
-						// create a new batch for this type. The batch number is the number of current batches.
-						latestBatchNumberForType = actionBatches.size();
-						latestBatches.put( entityName, latestBatchNumberForType );
-						// since this entity will now be processed in the latest possible batch,
-						// we can be assured that it will come after all other associations,
-						// there's not need to continue checking.
-						break;
+				for ( int i = 0; i < propertyValues.length; i++ ) {
+					Object value = propertyValues[i];
+					Type type = propertyTypes[i];
+					addParentChildEntityNameByPropertyAndValue( action, batchIdentifier, type, value );
+				}
+
+				if ( identifierType.isComponentType() ) {
+					CompositeType compositeType = (CompositeType) identifierType;
+					Type[] compositeIdentifierTypes = compositeType.getSubtypes();
+
+					for ( Type type : compositeIdentifierTypes ) {
+						addParentChildEntityNameByPropertyAndValue( action, batchIdentifier, type, null );
 					}
 				}
 			}
-			return latestBatchNumberForType;
 		}
 
-		private void addToBatch(Integer batchNumber, AbstractEntityInsertAction action) {
-			List<AbstractEntityInsertAction> actions = actionBatches.get( batchNumber );
+		private void addParentChildEntityNameByPropertyAndValue(AbstractEntityInsertAction action, BatchIdentifier batchIdentifier, Type type, Object value) {
+			if ( type.isEntityType() ) {
+				final EntityType entityType = (EntityType) type;
+				final String entityName = entityType.getName();
+				final String rootEntityName = action.getSession().getFactory().getMetamodel().entityPersister( entityName ).getRootEntityName();
+
+				if ( entityType.isOneToOne() && OneToOneType.class.cast( entityType ).getForeignKeyDirection() == ForeignKeyDirection.TO_PARENT ) {
+					if ( !entityType.isReferenceToPrimaryKey() ) {
+						batchIdentifier.getChildEntityNames().add( entityName );
+					}
+					if ( !rootEntityName.equals( entityName ) ) {
+						batchIdentifier.getChildEntityNames().add( rootEntityName );
+					}
+				}
+				else {
+					if ( !batchIdentifier.getEntityName().equals( entityName ) ) {
+						batchIdentifier.getParentEntityNames().add( entityName );
+					}
+					if ( value != null ) {
+						String valueClass = value.getClass().getName();
+						if ( !valueClass.equals( entityName ) ) {
+							batchIdentifier.getParentEntityNames().add( valueClass );
+						}
+					}
+					if ( !rootEntityName.equals( entityName ) ) {
+						batchIdentifier.getParentEntityNames().add( rootEntityName );
+					}
+				}
+			}
+			else if ( type.isCollectionType() ) {
+				CollectionType collectionType = (CollectionType) type;
+				final SessionFactoryImplementor sessionFactory = ( (SessionImplementor) action.getSession() )
+						.getSessionFactory();
+				if ( collectionType.getElementType( sessionFactory ).isEntityType() &&
+						!sessionFactory.getMetamodel().collectionPersister( collectionType.getRole() ).isManyToMany() ) {
+					String entityName = collectionType.getAssociatedEntityName( sessionFactory );
+					String rootEntityName = action.getSession().getFactory().getMetamodel().entityPersister( entityName ).getRootEntityName();
+					batchIdentifier.getChildEntityNames().add( entityName );
+					if ( !rootEntityName.equals( entityName ) ) {
+						batchIdentifier.getChildEntityNames().add( rootEntityName );
+					}
+				}
+			}
+			else if ( type.isComponentType() && value != null ) {
+				// Support recursive checks of composite type properties for associations and collections.
+				CompositeType compositeType = (CompositeType) type;
+				final SharedSessionContractImplementor session = action.getSession();
+				Object[] componentValues = compositeType.getPropertyValues( value, session );
+				for ( int j = 0; j < componentValues.length; ++j ) {
+					Type componentValueType = compositeType.getSubtypes()[j];
+					Object componentValue = componentValues[j];
+					addParentChildEntityNameByPropertyAndValue( action, batchIdentifier, componentValueType, componentValue );
+				}
+			}
+		}
+
+		private void addToBatch(BatchIdentifier batchIdentifier, AbstractEntityInsertAction action) {
+			List<AbstractEntityInsertAction> actions = actionBatches.get( batchIdentifier );
 
 			if ( actions == null ) {
-				actions = new LinkedList<AbstractEntityInsertAction>();
-				actionBatches.put( batchNumber, actions );
+				actions = new LinkedList<>();
+				actionBatches.put( batchIdentifier, actions );
 			}
 			actions.add( action );
 		}

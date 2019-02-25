@@ -35,7 +35,6 @@ import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -64,6 +63,7 @@ import org.hibernate.internal.CoreLogging;
 import org.hibernate.internal.CoreMessageLogger;
 import org.hibernate.proxy.HibernateProxy;
 import org.hibernate.proxy.LazyInitializer;
+import org.hibernate.tuple.entity.EntityMetamodel;
 import org.hibernate.type.CollectionType;
 import org.hibernate.type.CompositeType;
 import org.hibernate.type.EntityType;
@@ -813,9 +813,9 @@ public class ActionQueue {
 			private final String entityName;
 			private final String rootEntityName;
 
-			private Set<String> parentEntityNames = new HashSet<>( );
+			private Set<String> parentEntityNames = new HashSet<String>( );
 
-			private Set<String> childEntityNames = new HashSet<>( );
+			private Set<String> childEntityNames = new HashSet<String>( );
 
 			private BatchIdentifier parent;
 
@@ -841,12 +841,12 @@ public class ActionQueue {
 					return false;
 				}
 				BatchIdentifier that = (BatchIdentifier) o;
-				return Objects.equals( entityName, that.entityName );
+				return (entityName == that.entityName) || (entityName != null && entityName.equals(that.entityName));
 			}
 
 			@Override
 			public int hashCode() {
-				return Objects.hash( entityName );
+				return entityName != null ? entityName.hashCode() : 0;
 			}
 
 			String getEntityName() {
@@ -887,7 +887,7 @@ public class ActionQueue {
 						parent == batchIdentifier
 								|| parentEntityNames.contains( batchIdentifier.getEntityName() )
 								|| ( parentEntityNames.contains( batchIdentifier.getRootEntityName() ) && !this.getEntityName().equals( batchIdentifier.getRootEntityName() ) )
-								|| parent != null && parent.hasParent( batchIdentifier, new ArrayList<>() )
+								|| parent != null && parent.hasParent( batchIdentifier, new ArrayList<BatchIdentifier>() )
 				);
 			}
 
@@ -917,16 +917,15 @@ public class ActionQueue {
 		 */
 		public void sort(List<AbstractEntityInsertAction> insertions) {
 			// optimize the hash size to eliminate a rehash.
-			this.latestBatches = new ArrayList<>( );
-			this.actionBatches = new HashMap<>();
+			this.latestBatches = new ArrayList<BatchIdentifier>( );
+			this.actionBatches = new HashMap<BatchIdentifier, List<AbstractEntityInsertAction>>();
 
 			for ( AbstractEntityInsertAction action : insertions ) {
 				BatchIdentifier batchIdentifier = new BatchIdentifier(
 						action.getEntityName(),
 						action.getSession()
 						      .getFactory()
-						      .getMetamodel()
-						      .entityPersister( action.getEntityName() )
+						      .getEntityPersister( action.getEntityName() )
 						      .getRootEntityName()
 				);
 
@@ -1032,10 +1031,10 @@ public class ActionQueue {
 		 */
 		private void addParentChildEntityNames(AbstractEntityInsertAction action, BatchIdentifier batchIdentifier) {
 			Object[] propertyValues = action.getState();
-			ClassMetadata classMetadata = action.getPersister().getClassMetadata();
-			if ( classMetadata != null ) {
-				Type[] propertyTypes = classMetadata.getPropertyTypes();
-				Type identifierType = classMetadata.getIdentifierType();
+			EntityMetamodel entityMetamodel = action.getPersister().getEntityMetamodel();
+			if ( entityMetamodel != null ) {
+				Type[] propertyTypes = entityMetamodel.getPropertyTypes();
+				Type identifierType = entityMetamodel.getIdentifierProperty().getType();
 
 				for ( int i = 0; i < propertyValues.length; i++ ) {
 					Object value = propertyValues[i];
@@ -1058,9 +1057,9 @@ public class ActionQueue {
 			if ( type.isEntityType() ) {
 				final EntityType entityType = (EntityType) type;
 				final String entityName = entityType.getName();
-				final String rootEntityName = action.getSession().getFactory().getMetamodel().entityPersister( entityName ).getRootEntityName();
+				final String rootEntityName = action.getSession().getFactory().getEntityPersister( entityName ).getRootEntityName();
 
-				if ( entityType.isOneToOne() && OneToOneType.class.cast( entityType ).getForeignKeyDirection() == ForeignKeyDirection.TO_PARENT ) {
+				if ( entityType.isOneToOne() && OneToOneType.class.cast( entityType ).getForeignKeyDirection().equals( ForeignKeyDirection.FOREIGN_KEY_TO_PARENT ) ) {
 					if ( !entityType.isReferenceToPrimaryKey() ) {
 						batchIdentifier.getChildEntityNames().add( entityName );
 					}
@@ -1086,11 +1085,11 @@ public class ActionQueue {
 			else if ( type.isCollectionType() ) {
 				CollectionType collectionType = (CollectionType) type;
 				final SessionFactoryImplementor sessionFactory = ( (SessionImplementor) action.getSession() )
-						.getSessionFactory();
+						.getFactory();
 				if ( collectionType.getElementType( sessionFactory ).isEntityType() &&
-						!sessionFactory.getMetamodel().collectionPersister( collectionType.getRole() ).isManyToMany() ) {
+						!sessionFactory.getCollectionPersister( collectionType.getRole() ).isManyToMany() ) {
 					String entityName = collectionType.getAssociatedEntityName( sessionFactory );
-					String rootEntityName = action.getSession().getFactory().getMetamodel().entityPersister( entityName ).getRootEntityName();
+					String rootEntityName = action.getSession().getFactory().getEntityPersister( entityName ).getRootEntityName();
 					batchIdentifier.getChildEntityNames().add( entityName );
 					if ( !rootEntityName.equals( entityName ) ) {
 						batchIdentifier.getChildEntityNames().add( rootEntityName );
@@ -1100,7 +1099,7 @@ public class ActionQueue {
 			else if ( type.isComponentType() && value != null ) {
 				// Support recursive checks of composite type properties for associations and collections.
 				CompositeType compositeType = (CompositeType) type;
-				final SharedSessionContractImplementor session = action.getSession();
+				final SessionImplementor session = action.getSession();
 				Object[] componentValues = compositeType.getPropertyValues( value, session );
 				for ( int j = 0; j < componentValues.length; ++j ) {
 					Type componentValueType = compositeType.getSubtypes()[j];
@@ -1114,7 +1113,7 @@ public class ActionQueue {
 			List<AbstractEntityInsertAction> actions = actionBatches.get( batchIdentifier );
 
 			if ( actions == null ) {
-				actions = new LinkedList<>();
+				actions = new LinkedList<AbstractEntityInsertAction>();
 				actionBatches.put( batchIdentifier, actions );
 			}
 			actions.add( action );
